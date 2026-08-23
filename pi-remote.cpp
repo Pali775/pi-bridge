@@ -9,9 +9,9 @@
 
 static void logLine(const std::string& text)
 {
-    std::ofstream f("C:\\pi-bridge\\bridge.log", std::ios::app);
+    std::ofstream f("C:\\pi-bridge\\bridge.log", std::ios::app | std::ios::binary);
     if (f)
-        f << text << std::endl;
+        f << text << "\r\n";
 }
 
 struct ForwardArgs {
@@ -19,11 +19,17 @@ struct ForwardArgs {
     HANDLE to;
     bool closeToWhenDone;
     const char* name;
+    const char* teeFile; // optional extra log file
 };
 
 DWORD WINAPI ForwardBytes(LPVOID param)
 {
     auto* args = static_cast<ForwardArgs*>(param);
+
+    std::ofstream tee;
+    if (args->teeFile != nullptr) {
+        tee.open(args->teeFile, std::ios::app | std::ios::binary);
+    }
 
     char buffer[8192];
     DWORD bytesRead = 0;
@@ -31,6 +37,11 @@ DWORD WINAPI ForwardBytes(LPVOID param)
     while (ReadFile(args->from, buffer, sizeof(buffer), &bytesRead, nullptr) &&
            bytesRead > 0)
     {
+        if (tee.is_open()) {
+            tee.write(buffer, bytesRead);
+            tee.flush();
+        }
+
         DWORD totalWritten = 0;
 
         while (totalWritten < bytesRead)
@@ -88,8 +99,6 @@ int main()
 
     std::wstring command =
         L"ssh.exe "
-        L"-vvv "
-        L"-E C:\\pi-bridge\\ssh.log "
         L"-T "
         L"-o BatchMode=yes "
         L"-o IdentitiesOnly=yes "
@@ -124,17 +133,9 @@ int main()
 
     logLine("pipes created");
 
-    if (!SetHandleInformation(sshStdinWrite, HANDLE_FLAG_INHERIT, 0))
-        logLine("SetHandleInformation(stdin) failed; error=" +
-                std::to_string(GetLastError()));
-
-    if (!SetHandleInformation(sshStdoutRead, HANDLE_FLAG_INHERIT, 0))
-        logLine("SetHandleInformation(stdout) failed; error=" +
-                std::to_string(GetLastError()));
-
-    if (!SetHandleInformation(sshStderrRead, HANDLE_FLAG_INHERIT, 0))
-        logLine("SetHandleInformation(stderr) failed; error=" +
-                std::to_string(GetLastError()));
+    SetHandleInformation(sshStdinWrite, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(sshStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(sshStderrRead, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -162,7 +163,6 @@ int main()
 
     DWORD createProcessError = started ? ERROR_SUCCESS : GetLastError();
 
-    // Parent does not use the child-side handles.
     CloseHandle(sshStdinRead);
     CloseHandle(sshStdoutWrite);
     CloseHandle(sshStderrWrite);
@@ -186,32 +186,28 @@ int main()
     HANDLE parentStdout = GetStdHandle(STD_OUTPUT_HANDLE);
     HANDLE parentStderr = GetStdHandle(STD_ERROR_HANDLE);
 
-    logLine("parent stdin handle=" +
-            std::to_string(reinterpret_cast<uintptr_t>(parentStdin)));
-    logLine("parent stdout handle=" +
-            std::to_string(reinterpret_cast<uintptr_t>(parentStdout)));
-    logLine("parent stderr handle=" +
-            std::to_string(reinterpret_cast<uintptr_t>(parentStderr)));
-
     ForwardArgs stdinArgs{
         parentStdin,
         sshStdinWrite,
         true,
-        "stdin->ssh"
+        "stdin->ssh",
+        nullptr
     };
 
     ForwardArgs stdoutArgs{
         sshStdoutRead,
         parentStdout,
         false,
-        "ssh->stdout"
+        "ssh->stdout",
+        nullptr
     };
 
     ForwardArgs stderrArgs{
         sshStderrRead,
         parentStderr,
         false,
-        "ssh->stderr"
+        "ssh->stderr",
+        "C:\\pi-bridge\\ssh-stderr.log"
     };
 
     logLine("starting forwarding threads");
@@ -272,7 +268,6 @@ int main()
     logLine("stdout thread wait result=" + std::to_string(stdoutWait));
     logLine("stderr thread wait result=" + std::to_string(stderrWait));
 
-    // Do not wait indefinitely for stdin because VS Code can keep its pipe open.
     CloseHandle(stdinThread);
     CloseHandle(stdoutThread);
     CloseHandle(stderrThread);
