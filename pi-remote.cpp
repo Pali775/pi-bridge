@@ -10,12 +10,10 @@
 static void logLine(const std::string& text)
 {
     std::ofstream f("C:\\pi-bridge\\bridge.log", std::ios::app | std::ios::binary);
-    if (f)
-        f << text << "\r\n";
+    if (f) f << text << "\r\n";
 }
 
-struct ForwardArgs
-{
+struct ForwardArgs {
     HANDLE from;
     HANDLE to;
     bool closeDestinationWhenDone;
@@ -25,7 +23,6 @@ struct ForwardArgs
 DWORD WINAPI ForwardBytes(LPVOID param)
 {
     auto* args = static_cast<ForwardArgs*>(param);
-
     char buffer[8192];
     DWORD bytesRead = 0;
 
@@ -33,28 +30,19 @@ DWORD WINAPI ForwardBytes(LPVOID param)
            bytesRead > 0)
     {
         DWORD offset = 0;
-
         while (offset < bytesRead)
         {
             DWORD bytesWritten = 0;
-
-            if (!WriteFile(
-                    args->to,
-                    buffer + offset,
-                    bytesRead - offset,
-                    &bytesWritten,
-                    nullptr))
+            if (!WriteFile(args->to, buffer + offset, bytesRead - offset,
+                           &bytesWritten, nullptr))
             {
                 logLine(std::string(args->name) +
                         ": WriteFile failed; error=" +
                         std::to_string(GetLastError()));
-
                 if (args->closeDestinationWhenDone)
                     CloseHandle(args->to);
-
                 return 1;
             }
-
             offset += bytesWritten;
         }
     }
@@ -73,24 +61,19 @@ int main()
     logLine("bridge started");
     logLine("command-line arguments intentionally ignored");
 
-    // Pi Chat may launch:
-    //
-    //   pi-remote.exe --mode rpc
-    //
-    // All CLI arguments are intentionally ignored.
-    //
-    // The dedicated SSH key is restricted server-side with a forced command,
-    // so this bridge only opens the SSH connection. The Debian SSH server
-    // decides which command is executed.
-
     const wchar_t* sshPath =
         L"C:\\Windows\\System32\\OpenSSH\\ssh.exe";
 
+    // Everything important is explicit so the VS Code Extension Host
+    // environment cannot silently change SSH behaviour.
     std::wstring command =
         L"ssh.exe "
         L"-T "
+        L"-F NUL "
         L"-o BatchMode=yes "
         L"-o IdentitiesOnly=yes "
+        L"-o StrictHostKeyChecking=yes "
+        L"-o UserKnownHostsFile=C:\\Users\\Pali\\.ssh\\known_hosts "
         L"-i C:\\Users\\Pali\\.ssh\\pi_bridge "
         L"pali@192.168.255.129";
 
@@ -101,35 +84,44 @@ int main()
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    HANDLE sshStdinRead   = nullptr;
-    HANDLE sshStdinWrite  = nullptr;
-    HANDLE sshStdoutRead  = nullptr;
-    HANDLE sshStdoutWrite = nullptr;
-    HANDLE sshStderrRead  = nullptr;
-    HANDLE sshStderrWrite = nullptr;
-
-    logLine("creating SSH pipes");
+    HANDLE sshStdinRead = nullptr, sshStdinWrite = nullptr;
+    HANDLE sshStdoutRead = nullptr, sshStdoutWrite = nullptr;
 
     if (!CreatePipe(&sshStdinRead, &sshStdinWrite, &sa, 0) ||
-        !CreatePipe(&sshStdoutRead, &sshStdoutWrite, &sa, 0) ||
-        !CreatePipe(&sshStderrRead, &sshStderrWrite, &sa, 0))
+        !CreatePipe(&sshStdoutRead, &sshStdoutWrite, &sa, 0))
     {
-        logLine("CreatePipe failed; error=" +
-                std::to_string(GetLastError()));
+        logLine("CreatePipe failed; error=" + std::to_string(GetLastError()));
         return 100;
     }
 
-    // Bridge-side pipe ends must not be inherited by ssh.exe.
     SetHandleInformation(sshStdinWrite, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(sshStdoutRead, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(sshStderrRead, HANDLE_FLAG_INHERIT, 0);
+
+    // IMPORTANT: SSH stderr goes straight to a real file handle.
+    // This bypasses Pi Chat / VS Code stderr handling completely.
+    HANDLE sshErrorFile = CreateFileW(
+        L"C:\\pi-bridge\\ssh-stderr.log",
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (sshErrorFile == INVALID_HANDLE_VALUE)
+    {
+        logLine("CreateFile(ssh-stderr.log) failed; error=" +
+                std::to_string(GetLastError()));
+        return 101;
+    }
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput  = sshStdinRead;
     si.hStdOutput = sshStdoutWrite;
-    si.hStdError  = sshStderrWrite;
+    si.hStdError  = sshErrorFile;
 
     PROCESS_INFORMATION pi{};
 
@@ -148,31 +140,23 @@ int main()
         &pi
     );
 
-    // The bridge no longer needs the child-side handles.
     CloseHandle(sshStdinRead);
     CloseHandle(sshStdoutWrite);
-    CloseHandle(sshStderrWrite);
+    CloseHandle(sshErrorFile);
 
     if (!started)
     {
-        DWORD error = GetLastError();
-        logLine("CreateProcessW failed; error=" + std::to_string(error));
-
+        logLine("CreateProcessW failed; error=" +
+                std::to_string(GetLastError()));
         CloseHandle(sshStdinWrite);
         CloseHandle(sshStdoutRead);
-        CloseHandle(sshStderrRead);
-
-        return 101;
+        return 102;
     }
 
     logLine("ssh.exe started; PID=" + std::to_string(pi.dwProcessId));
 
-    HANDLE bridgeStdin  = GetStdHandle(STD_INPUT_HANDLE);
-    HANDLE bridgeStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    HANDLE bridgeStderr = GetStdHandle(STD_ERROR_HANDLE);
-
     ForwardArgs stdinArgs{
-        bridgeStdin,
+        GetStdHandle(STD_INPUT_HANDLE),
         sshStdinWrite,
         true,
         "stdin->ssh"
@@ -180,16 +164,9 @@ int main()
 
     ForwardArgs stdoutArgs{
         sshStdoutRead,
-        bridgeStdout,
+        GetStdHandle(STD_OUTPUT_HANDLE),
         false,
         "ssh->stdout"
-    };
-
-    ForwardArgs stderrArgs{
-        sshStderrRead,
-        bridgeStderr,
-        false,
-        "ssh->stderr"
     };
 
     HANDLE stdinThread =
@@ -198,28 +175,13 @@ int main()
     HANDLE stdoutThread =
         CreateThread(nullptr, 0, ForwardBytes, &stdoutArgs, 0, nullptr);
 
-    HANDLE stderrThread =
-        CreateThread(nullptr, 0, ForwardBytes, &stderrArgs, 0, nullptr);
-
-    if (!stdinThread || !stdoutThread || !stderrThread)
+    if (!stdinThread || !stdoutThread)
     {
-        DWORD error = GetLastError();
-        logLine("CreateThread failed; error=" + std::to_string(error));
-
-        TerminateProcess(pi.hProcess, 102);
+        logLine("CreateThread failed; error=" +
+                std::to_string(GetLastError()));
+        TerminateProcess(pi.hProcess, 103);
         WaitForSingleObject(pi.hProcess, INFINITE);
-
-        if (stdinThread)  CloseHandle(stdinThread);
-        if (stdoutThread) CloseHandle(stdoutThread);
-        if (stderrThread) CloseHandle(stderrThread);
-
-        CloseHandle(sshStdoutRead);
-        CloseHandle(sshStderrRead);
-
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-
-        return 102;
+        return 103;
     }
 
     logLine("stdio forwarding active");
@@ -228,30 +190,14 @@ int main()
     WaitForSingleObject(pi.hProcess, INFINITE);
 
     DWORD exitCode = 999;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    logLine("ssh.exe exit code=" + std::to_string(exitCode));
 
-    if (!GetExitCodeProcess(pi.hProcess, &exitCode))
-    {
-        logLine("GetExitCodeProcess failed; error=" +
-                std::to_string(GetLastError()));
-        exitCode = 103;
-    }
-    else
-    {
-        logLine("ssh.exe exit code=" + std::to_string(exitCode));
-    }
-
-    // ssh.exe closing its pipes should let stdout/stderr threads finish.
     WaitForSingleObject(stdoutThread, 2000);
-    WaitForSingleObject(stderrThread, 2000);
 
-    // Do not block waiting for stdin; VS Code may keep that pipe open.
     CloseHandle(stdinThread);
     CloseHandle(stdoutThread);
-    CloseHandle(stderrThread);
-
     CloseHandle(sshStdoutRead);
-    CloseHandle(sshStderrRead);
-
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
