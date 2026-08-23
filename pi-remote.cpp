@@ -2,14 +2,23 @@
 #define _UNICODE
 
 #include <windows.h>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+static void logLine(const std::string& text)
+{
+    std::ofstream f("C:\\pi-bridge\\bridge.log", std::ios::app);
+    if (f)
+        f << text << std::endl;
+}
 
 struct ForwardArgs {
     HANDLE from;
     HANDLE to;
     bool closeToWhenDone;
+    const char* name;
 };
 
 DWORD WINAPI ForwardBytes(LPVOID param)
@@ -35,6 +44,10 @@ DWORD WINAPI ForwardBytes(LPVOID param)
                     &bytesWritten,
                     nullptr))
             {
+                logLine(std::string(args->name) +
+                        ": WriteFile failed; error=" +
+                        std::to_string(GetLastError()));
+
                 if (args->closeToWhenDone)
                     CloseHandle(args->to);
 
@@ -45,6 +58,12 @@ DWORD WINAPI ForwardBytes(LPVOID param)
         }
     }
 
+    DWORD readError = GetLastError();
+
+    logLine(std::string(args->name) +
+            ": forwarding ended; ReadFile error=" +
+            std::to_string(readError));
+
     if (args->closeToWhenDone)
         CloseHandle(args->to);
 
@@ -53,20 +72,24 @@ DWORD WINAPI ForwardBytes(LPVOID param)
 
 int main()
 {
-    // Intentionally ignore every command-line argument.
+    logLine("========================================");
+    logLine("bridge started");
+    logLine("command-line arguments intentionally ignored");
+
+    // Pi Chat may invoke:
     //
-    // Pi Chat may launch this executable as:
+    //   pi-remote.exe --mode rpc
     //
-    //     pi-remote.exe --mode rpc
-    //
-    // None of those arguments are forwarded across the VM boundary.
-    // The remote command is fixed by design.
+    // All command-line arguments are intentionally ignored.
+    // Nothing received as a CLI argument is forwarded across the VM boundary.
 
     const wchar_t* sshPath =
         L"C:\\Windows\\System32\\OpenSSH\\ssh.exe";
 
     std::wstring command =
         L"ssh.exe "
+        L"-vvv "
+        L"-E C:\\pi-bridge\\ssh.log "
         L"-T "
         L"-o BatchMode=yes "
         L"-o IdentitiesOnly=yes "
@@ -74,7 +97,6 @@ int main()
         L"pali@192.168.255.129 "
         L"sudo /usr/local/bin/pi-rpc";
 
-    // CreateProcessW requires a writable, null-terminated buffer.
     std::vector<wchar_t> commandBuffer(command.begin(), command.end());
     commandBuffer.push_back(L'\0');
 
@@ -89,19 +111,30 @@ int main()
     HANDLE sshStderrRead  = nullptr;
     HANDLE sshStderrWrite = nullptr;
 
+    logLine("creating pipes");
+
     if (!CreatePipe(&sshStdinRead, &sshStdinWrite, &sa, 0) ||
         !CreatePipe(&sshStdoutRead, &sshStdoutWrite, &sa, 0) ||
         !CreatePipe(&sshStderrRead, &sshStderrWrite, &sa, 0))
     {
-        std::cerr << "pi-remote: CreatePipe failed; Win32 error="
-                  << GetLastError() << '\n';
+        DWORD error = GetLastError();
+        logLine("CreatePipe failed; error=" + std::to_string(error));
         return 100;
     }
 
-    // These are used only by this bridge process and must not be inherited.
-    SetHandleInformation(sshStdinWrite,  HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(sshStdoutRead,  HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(sshStderrRead,  HANDLE_FLAG_INHERIT, 0);
+    logLine("pipes created");
+
+    if (!SetHandleInformation(sshStdinWrite, HANDLE_FLAG_INHERIT, 0))
+        logLine("SetHandleInformation(stdin) failed; error=" +
+                std::to_string(GetLastError()));
+
+    if (!SetHandleInformation(sshStdoutRead, HANDLE_FLAG_INHERIT, 0))
+        logLine("SetHandleInformation(stdout) failed; error=" +
+                std::to_string(GetLastError()));
+
+    if (!SetHandleInformation(sshStderrRead, HANDLE_FLAG_INHERIT, 0))
+        logLine("SetHandleInformation(stderr) failed; error=" +
+                std::to_string(GetLastError()));
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -111,6 +144,8 @@ int main()
     si.hStdError  = sshStderrWrite;
 
     PROCESS_INFORMATION pi{};
+
+    logLine("calling CreateProcessW for ssh.exe");
 
     BOOL started = CreateProcessW(
         sshPath,
@@ -125,15 +160,17 @@ int main()
         &pi
     );
 
-    // Parent no longer needs the child-side handles.
+    DWORD createProcessError = started ? ERROR_SUCCESS : GetLastError();
+
+    // Parent does not use the child-side handles.
     CloseHandle(sshStdinRead);
     CloseHandle(sshStdoutWrite);
     CloseHandle(sshStderrWrite);
 
     if (!started)
     {
-        std::cerr << "pi-remote: failed to start ssh.exe; Win32 error="
-                  << GetLastError() << '\n';
+        logLine("CreateProcessW FAILED; error=" +
+                std::to_string(createProcessError));
 
         CloseHandle(sshStdinWrite);
         CloseHandle(sshStdoutRead);
@@ -142,23 +179,42 @@ int main()
         return 101;
     }
 
+    logLine("ssh.exe started successfully");
+    logLine("ssh PID=" + std::to_string(pi.dwProcessId));
+
+    HANDLE parentStdin  = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE parentStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE parentStderr = GetStdHandle(STD_ERROR_HANDLE);
+
+    logLine("parent stdin handle=" +
+            std::to_string(reinterpret_cast<uintptr_t>(parentStdin)));
+    logLine("parent stdout handle=" +
+            std::to_string(reinterpret_cast<uintptr_t>(parentStdout)));
+    logLine("parent stderr handle=" +
+            std::to_string(reinterpret_cast<uintptr_t>(parentStderr)));
+
     ForwardArgs stdinArgs{
-        GetStdHandle(STD_INPUT_HANDLE),
+        parentStdin,
         sshStdinWrite,
-        true
+        true,
+        "stdin->ssh"
     };
 
     ForwardArgs stdoutArgs{
         sshStdoutRead,
-        GetStdHandle(STD_OUTPUT_HANDLE),
-        false
+        parentStdout,
+        false,
+        "ssh->stdout"
     };
 
     ForwardArgs stderrArgs{
         sshStderrRead,
-        GetStdHandle(STD_ERROR_HANDLE),
-        false
+        parentStderr,
+        false,
+        "ssh->stderr"
     };
+
+    logLine("starting forwarding threads");
 
     HANDLE stdinThread =
         CreateThread(nullptr, 0, ForwardBytes, &stdinArgs, 0, nullptr);
@@ -171,8 +227,8 @@ int main()
 
     if (!stdinThread || !stdoutThread || !stderrThread)
     {
-        std::cerr << "pi-remote: CreateThread failed; Win32 error="
-                  << GetLastError() << '\n';
+        DWORD error = GetLastError();
+        logLine("CreateThread FAILED; error=" + std::to_string(error));
 
         TerminateProcess(pi.hProcess, 102);
         WaitForSingleObject(pi.hProcess, INFINITE);
@@ -190,24 +246,33 @@ int main()
         return 102;
     }
 
-    // Keep the bridge alive for the lifetime of the SSH/RPC session.
+    logLine("forwarding threads started");
+    logLine("waiting for ssh.exe");
+
     WaitForSingleObject(pi.hProcess, INFINITE);
 
-    DWORD exitCode = 1;
+    logLine("ssh.exe terminated");
+
+    DWORD exitCode = 999;
 
     if (!GetExitCodeProcess(pi.hProcess, &exitCode))
     {
-        std::cerr << "pi-remote: failed to read ssh.exe exit code; Win32 error="
-                  << GetLastError() << '\n';
-
+        DWORD error = GetLastError();
+        logLine("GetExitCodeProcess FAILED; error=" + std::to_string(error));
         exitCode = 103;
     }
+    else
+    {
+        logLine("ssh.exe exit code=" + std::to_string(exitCode));
+    }
 
-    // stdout/stderr should reach EOF once ssh.exe exits.
-    WaitForSingleObject(stdoutThread, 2000);
-    WaitForSingleObject(stderrThread, 2000);
+    DWORD stdoutWait = WaitForSingleObject(stdoutThread, 2000);
+    DWORD stderrWait = WaitForSingleObject(stderrThread, 2000);
 
-    // Do not wait indefinitely for stdin: VS Code may keep the pipe open.
+    logLine("stdout thread wait result=" + std::to_string(stdoutWait));
+    logLine("stderr thread wait result=" + std::to_string(stderrWait));
+
+    // Do not wait indefinitely for stdin because VS Code can keep its pipe open.
     CloseHandle(stdinThread);
     CloseHandle(stdoutThread);
     CloseHandle(stderrThread);
@@ -217,6 +282,9 @@ int main()
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    logLine("bridge exiting with code=" + std::to_string(exitCode));
+    logLine("========================================");
 
     return static_cast<int>(exitCode);
 }
